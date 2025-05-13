@@ -1,0 +1,35 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.ruff_cache/
+*.xml
+.repomix
+repomix*.xml
+
+# Environment files
+.env
+
+# MCP cache and logs
+.mcp-pihole-api.json
+.mcp-pihole-api.log
+
+# Docker volumes
+cache/
+logs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

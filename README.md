@@ -93,6 +93,12 @@ The server provides the following tools:
 - `get_blocking_status`: Get current DNS blocking status and any active timers
 - `set_blocking_status`: Enable or disable DNS blocking with optional timer
 
+### DNS Host Backup and Restore
+
+- `backup_dns_hosts`: Creates a backup of all current DNS host entries to a timestamped JSON file in the `~/.mcp-pihole-backups/` directory.
+- `list_dns_backups`: Lists all available DNS host backup files found in `~/.mcp-pihole-backups/`.
+- `restore_dns_hosts (filename: str)`: Restores DNS host entries from the specified backup file. The filename should be one of those listed by `list_dns_backups`. Backups are stored in JSON format.
+
 ## Example Usage in Claude
 
 Once connected to Claude, you can use the following prompts:
@@ -109,6 +115,12 @@ Once connected to Claude, you can use the following prompts:
 - "Enable DNS blocking"
 - "Disable DNS blocking for 30 minutes"
 - "Enable DNS blocking for 1 hour"
+
+### DNS Host Backup and Restore
+
+- "Create a backup of my DNS hosts."
+- "Show me all DNS backups."
+- "Restore DNS hosts from backup 'backup-YYYYMMDD-HHMMSS.json'."
 
 ## Testing
 
@@ -151,6 +163,7 @@ The server creates the following files in your home directory:
 
 - `~/.mcp-pihole-api.json`: Session cache (secure permissions)
 - `~/.mcp-pihole-api.log`: Log file (when `DNS_API_LOG_TO_FILE=true`)
+- `~/.mcp-pihole-backups/`: Directory for DNS host backup files (JSON format).
 
 ## Development
 

@@ -23,6 +23,7 @@ import os.path
 import stat
 import pathlib
 import logging
+from datetime import datetime
 from enum import Enum
 from pydantic import BaseModel, AnyHttpUrl, Field, IPvAnyAddress
 from typing import Dict, List, Optional
@@ -33,6 +34,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 HOME_DIR = pathlib.Path.home()
+BACKUP_DIR = HOME_DIR / ".mcp-pihole-backups"
 
 # Get log level from environment or default to INFO
 log_level_str = os.getenv("DNS_API_LOG_LEVEL", "INFO").upper()
@@ -132,6 +134,32 @@ class BlockingStatusRequest(BaseModel):
         None,
         description="Optional timer in seconds after which the opposite blocking mode is set",
     )
+
+
+class BackupFile(BaseModel):
+    """
+    Model for backup file information.
+
+    Attributes:
+        filename (str): The name of the backup file.
+        created_at (float): The UNIX timestamp of when the backup was created.
+    """
+
+    filename: str = Field(description="The name of the backup file")
+    created_at: float = Field(
+        description="The UNIX timestamp of when the backup was created"
+    )
+
+
+class RestoreRequest(BaseModel):
+    """
+    Model for restore request.
+
+    Attributes:
+        filename (str): The name of the backup file to restore.
+    """
+
+    filename: str = Field(description="The name of the backup file to restore")
 
 
 config = Config.model_validate(
@@ -536,6 +564,173 @@ async def set_blocking_status(blocking: bool, timer: Optional[float] = None) -> 
         return f"Error setting blocking status: {str(e)}"
 
 
+@mcp.tool()
+async def backup_dns_hosts() -> str:
+    """
+    Backup current DNS host entries to a timestamped JSON file.
+
+    Retrieves all DNS host entries from the API and saves them to a
+    JSON file in the BACKUP_DIR.
+
+    Returns:
+        str: Confirmation message of the backup, or an error message.
+    """
+    try:
+        # Ensure backup directory exists with correct permissions
+        os.makedirs(BACKUP_DIR, mode=0o700, exist_ok=True)
+        logging.info(f"Ensured backup directory exists: {BACKUP_DIR}")
+
+        response = await make_api_request("GET", "api/config/dns/hosts")
+        hosts = response.get("config", {}).get("dns", {}).get("hosts", [])
+
+        if not hosts:
+            logging.info("No DNS hosts found to backup.")
+            return "No DNS hosts to backup."
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"backup-{timestamp}.json"
+        filepath = BACKUP_DIR / filename
+
+        with open(filepath, "w") as f:
+            json.dump(hosts, f, indent=4)
+
+        logging.info(f"Successfully backed up {len(hosts)} DNS hosts to {filepath}")
+        return f"Successfully backed up {len(hosts)} DNS hosts to {filename}"
+
+    except Exception as e:
+        logging.error(f"Error during DNS host backup: {str(e)}")
+        return f"Error backing up DNS hosts: {str(e)}"
+
+
+@mcp.tool()
+async def list_dns_backups() -> List[BackupFile] | str:
+    """
+    List all DNS backup files.
+
+    Scans the BACKUP_DIR for files matching 'backup-*.json',
+    creates BackupFile objects for them, and returns them sorted by
+    creation time (newest first).
+
+    Returns:
+        List[BackupFile] | str: A list of BackupFile objects or an error message string.
+    """
+    if not BACKUP_DIR.exists():
+        logging.debug(f"Backup directory {BACKUP_DIR} does not exist.")
+        return []
+
+    backup_files: List[BackupFile] = []
+    try:
+        for item in BACKUP_DIR.glob("backup-*.json"):
+            if item.is_file():
+                try:
+                    timestamp = os.path.getmtime(item)
+                    backup_files.append(
+                        BackupFile(filename=item.name, created_at=timestamp)
+                    )
+                except Exception as e:
+                    logging.error(
+                        f"Error processing backup file {item.name}: {str(e)}"
+                    )
+        
+        # Sort by creation_at timestamp, newest first
+        backup_files.sort(key=lambda bf: bf.created_at, reverse=True)
+        
+        logging.info(f"Found {len(backup_files)} DNS backup files.")
+        return backup_files
+    except Exception as e:
+        logging.error(f"Error listing DNS backups: {str(e)}")
+        return f"Error listing DNS backups: {str(e)}"
+
+
+@mcp.tool()
+async def restore_dns_hosts(filename: str) -> str:
+    """
+    Restore DNS host entries from a backup file.
+
+    Reads a JSON backup file, validates its content, and attempts to
+    restore each DNS host entry via the API.
+
+    Args:
+        filename (str): The name of the backup file to restore.
+
+    Returns:
+        str: A summary message of the restore operation.
+    """
+    backup_file_path = BACKUP_DIR / filename
+    logging.info(f"Attempting to restore DNS hosts from: {backup_file_path}")
+
+    if not backup_file_path.exists() or not backup_file_path.is_file():
+        logging.error(f"Backup file {filename} not found at {backup_file_path}.")
+        return f"Backup file {filename} not found."
+
+    try:
+        with open(backup_file_path, "r") as f:
+            content = json.load(f)
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON in backup file {filename}.")
+        return f"Invalid or corrupted backup file {filename}."
+    except Exception as e:
+        logging.error(f"Error reading backup file {filename}: {str(e)}")
+        return f"Error reading backup file {filename}: {str(e)}"
+
+    if not isinstance(content, list) or not all(
+        isinstance(item, str) for item in content
+    ):
+        logging.error(
+            f"Invalid content format in backup file {filename}. Expected a list of strings."
+        )
+        return f"Invalid or corrupted backup file {filename}."
+
+    if not content:
+        logging.info(f"No DNS host entries found in {filename} to restore.")
+        return f"No valid DNS host entries found in {filename} to restore."
+
+    success_count = 0
+    failure_count = 0
+    total_entries = len(content)
+
+    for host_entry in content:
+        parts = host_entry.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            logging.warning(
+                f"Skipping invalid host entry format: '{host_entry}' in {filename}"
+            )
+            failure_count += 1
+            continue
+
+        ip_address, hostname = parts
+        try:
+            # Validate IP and hostname using DnsHostRequest
+            validated_request = DnsHostRequest.model_validate(
+                {"ip_address": ip_address, "hostname": hostname}
+            )
+            # Use validated and potentially coerced values
+            valid_ip = str(validated_request.ip_address)
+            valid_hostname = validated_request.hostname
+
+            encoded_entry = quote(f"{valid_ip} {valid_hostname}")
+            endpoint = f"api/config/dns/hosts/{encoded_entry}"
+            await make_api_request("PUT", endpoint)
+            success_count += 1
+            logging.info(f"Successfully restored host: {valid_ip} {valid_hostname}")
+        except Exception as e:
+            logging.error(
+                f"Failed to restore host '{host_entry}' from {filename}: {str(e)}"
+            )
+            failure_count += 1
+
+    if failure_count == 0 and success_count > 0:
+        return f"Successfully restored {success_count} DNS hosts from {filename}."
+    elif success_count > 0 and failure_count > 0:
+        return f"Restored {success_count} of {total_entries} DNS hosts from {filename}. Failures: {failure_count}."
+    elif success_count == 0 and failure_count > 0:
+        if total_entries == 0 : # Should be caught by "if not content" but as a safeguard
+             return f"No valid DNS host entries found in {filename} to restore."
+        return f"Failed to restore any DNS hosts from {filename}. Processed {total_entries} entries, all failed."
+    else: # success_count == 0 and failure_count == 0 (e.g. empty list after filtering)
+        return f"No valid DNS host entries found in {filename} to restore."
+
+
 @mcp.prompt()
 def dns_host_add_prompt(ip_address: str, hostname: str) -> str:
     """
@@ -607,6 +802,42 @@ def disable_blocking_prompt(duration_minutes: Optional[int] = None) -> str:
         return f"Please disable DNS blocking for {duration_minutes} minutes."
     else:
         return "Please disable DNS blocking permanently."
+
+
+@mcp.prompt()
+def backup_dns_hosts_prompt() -> str:
+    """
+    Create a prompt for backing up DNS host entries.
+
+    Returns:
+        str: A formatted prompt string for creating a DNS backup.
+    """
+    return "Create a new backup of all current DNS host entries."
+
+
+@mcp.prompt()
+def list_dns_backups_prompt() -> str:
+    """
+    Create a prompt for listing DNS backups.
+
+    Returns:
+        str: A formatted prompt string for listing DNS backups.
+    """
+    return "List all available DNS host entry backups."
+
+
+@mcp.prompt()
+def restore_dns_hosts_prompt(filename: str) -> str:
+    """
+    Create a prompt for restoring DNS host entries from a backup.
+
+    Args:
+        filename (str): The name of the backup file to restore.
+
+    Returns:
+        str: A formatted prompt string for restoring DNS entries.
+    """
+    return f"Restore DNS host entries from the backup file named '{filename}'."
 
 
 if __name__ == "__main__":
